@@ -1,3 +1,4 @@
+import time
 from enum import IntEnum
 from dataclasses import fields, MISSING
 
@@ -57,6 +58,11 @@ class CfgMemLayer(IntEnum):
     eLayerFlash = 2
     eLayerEnumSize = 3
 
+class GeofenceState(IntEnum):
+    eOFF = 0
+    eRequesting = 1
+    eON = 2
+
 #########################
 ### Physics Constants ###
 #########################
@@ -77,6 +83,15 @@ IBIT_WAIT_AFTER_RST = 10.0
 IBIT_TIMEOUT = IBIT_WAIT_AFTER_RST + 10.0 # [seconds]
 
 MIN_FILESTORE_CAPACITY = 10_000 # [bytes]
+
+GEOFENCE_REQ_PERIOD = 10 # [seconds]
+GEOREFERENCE_CONFIDENCE = 2 # 95%
+GEOREFERENCE_RADIUS_M = 20 # [meters]
+GEOREFERENCE_RADIUS_SCALE = 1e-2
+
+UBX_NAV_LAT_SCALE = 1e-7
+UBX_NAV_LON_SCALE = 1e-7
+UBX_NAV_HEIGHT_SCALE = 1e-3 # mm to m
 
 CFG_VAL_UNKNOWN = "NA"
 
@@ -344,21 +359,33 @@ APP_SPECIFIC_CFG = {
         "expectedVal": 0, # Rate null (no messages)
         "actualVal": CFG_VAL_UNKNOWN
     },
+    0x20910009: {
+        "name": "CFG-MSGOUT-UBX_NAV_PVT_USB",
+        "type": "U1",
+        "expectedVal": 1, # enable with rate 1
+        "actualVal": CFG_VAL_UNKNOWN
+    },
+    0x2091001d: {
+        "name": "CFG-MSGOUT-UBX_NAV_STATUS_USB",
+        "type": "U1",
+        "expectedVal": 1, # enable with rate 1
+        "actualVal": CFG_VAL_UNKNOWN
+    },
 
     # CFG-NAVSPG messages
     # ---------------------
-    0x20110011: {
-        "name": "CFG-NAVSPG-FIXMODE",
-        "type": "E1",
-        "expectedVal": 2, # 3D only
-        "actualVal": CFG_VAL_UNKNOWN
-    },
-    0x10110013: {
-        "name": "CFG-NAVSPG-INIFIX3D",
-        "type": "L",
-        "expectedVal": True,
-        "actualVal": CFG_VAL_UNKNOWN
-    },
+    # 0x20110011: {
+    #     "name": "CFG-NAVSPG-FIXMODE",
+    #     "type": "E1",
+    #     "expectedVal": 2, # 3D only
+    #     "actualVal": CFG_VAL_UNKNOWN
+    # },
+    # 0x10110013: {
+    #     "name": "CFG-NAVSPG-INIFIX3D",
+    #     "type": "L",
+    #     "expectedVal": True,
+    #     "actualVal": CFG_VAL_UNKNOWN
+    # },
     0x10110019: {
         "name": "CFG-NAVSPG-USE_PPP",
         "type": "L",
@@ -371,18 +398,18 @@ APP_SPECIFIC_CFG = {
         "expectedVal": 2, # Stationary
         "actualVal": CFG_VAL_UNKNOWN
     },
-    0x201100a1: {
-        "name": "CFG-NAVSPG-INFIL_MINSVS",
-        "type": "U1",
-        "expectedVal": 4, # sats
-        "actualVal": CFG_VAL_UNKNOWN
-    },
-    0x201100a4: {
-        "name": "CFG-NAVSPG-INFIL_MINELEV",
-        "type": "I1",
-        "expectedVal": 15, # deg
-        "actualVal": CFG_VAL_UNKNOWN
-    },
+    # 0x201100a1: {
+    #     "name": "CFG-NAVSPG-INFIL_MINSVS",
+    #     "type": "U1",
+    #     "expectedVal": 4, # sats
+    #     "actualVal": CFG_VAL_UNKNOWN
+    # },
+    # 0x201100a4: {
+    #     "name": "CFG-NAVSPG-INFIL_MINELEV",
+    #     "type": "I1",
+    #     "expectedVal": 15, # deg
+    #     "actualVal": CFG_VAL_UNKNOWN
+    # },
 
     # CFG-PM messages
     # ---------------------
@@ -395,7 +422,7 @@ APP_SPECIFIC_CFG = {
     0x40d00002: {
         "name": "CFG-PM-POSUPDATEPERIOD",
         "type": "U4",
-        "expectedVal": 30_000,
+        "expectedVal": 60,
         "actualVal": CFG_VAL_UNKNOWN
     },
 
@@ -410,18 +437,18 @@ APP_SPECIFIC_CFG = {
 
     # CFG-RATE messages
     # ---------------------
-    0x30210001: {
-        "name": "CFG-RATE-MEAS",
-        "type": "U2",
-        "expectedVal": 10_000,
-        "actualVal": CFG_VAL_UNKNOWN
-    },
-    0x30210002: {
-        "name": "CFG-RATE-NAV",
-        "type": "U2",
-        "expectedVal": 3,
-        "actualVal": CFG_VAL_UNKNOWN
-    },
+    # 0x30210001: {
+    #     "name": "CFG-RATE-MEAS",
+    #     "type": "U2",
+    #     "expectedVal": 10_000,
+    #     "actualVal": CFG_VAL_UNKNOWN
+    # },
+    # 0x30210002: {
+    #     "name": "CFG-RATE-NAV",
+    #     "type": "U2",
+    #     "expectedVal": 3,
+    #     "actualVal": CFG_VAL_UNKNOWN
+    # },
 
     # CFG-SBAS messages
     # ---------------------
@@ -579,13 +606,25 @@ UBX_NAV_PVT_LON_POS = UBX_PAYLOAD_POS + 24
 UBX_NAV_PVT_LAT_POS = UBX_PAYLOAD_POS + 28
 UBX_NAV_PVT_HEIGHT_POS = UBX_PAYLOAD_POS + 32
 UBX_NAV_PVT_HMSL_POS = UBX_PAYLOAD_POS + 36
+UBX_NAV_PVT_HACC_POS = UBX_PAYLOAD_POS + 40
 UBX_NAV_PVT_VELN_POS = UBX_PAYLOAD_POS + 48
 UBX_NAV_PVT_VELE_POS = UBX_PAYLOAD_POS + 52
 UBX_NAV_PVT_VELD_POS = UBX_PAYLOAD_POS + 56
 
-UBX_NAV_LAT_SCALE = 1e-7
-UBX_NAV_LON_SCALE = 1e-7
-UBX_NAV_HEIGHT_SCALE = 1e3 # mm to m
+# UBX-NAV-STATUS
+UBX_NAV_STATUS_ITOW_POS = UBX_PAYLOAD_POS + 0
+UBX_NAV_STATUS_GPSFIX_POS = UBX_PAYLOAD_POS + 4
+UBX_NAV_STATUS_FLAGS_POS = UBX_PAYLOAD_POS + 5
+UBX_NAV_STATUS_FIXSTAT_POS = UBX_PAYLOAD_POS + 6
+UBX_NAV_STATUS_FLAGS2_POS = UBX_PAYLOAD_POS + 7
+UBX_NAV_STATUS_TTFF_POS = UBX_PAYLOAD_POS + 8
+UBX_NAV_STATUS_MSSS_POS = UBX_PAYLOAD_POS + 12
+
+# UBX-NAV-GEOFENCE
+UBX_NAV_GEOFENCE_ITOW_POS = UBX_PAYLOAD_POS + 0
+UBX_NAV_GEOFENCE_STATUS_POS = UBX_PAYLOAD_POS + 5
+UBX_NAV_GEOFENCE_NUMFENCES_POS = UBX_PAYLOAD_POS + 6
+UBX_NAV_GEOFENCE_COMBSTATE_POS = UBX_PAYLOAD_POS + 7
 
 ##############################
 ### NMEA parsing constants ###
@@ -812,6 +851,18 @@ SUPPORTED_UBX_MSGS = {
 #############
 ### Utils ###
 #############
+def popN(dq, n):
+    """Pop n bytes from the left of deque and return them as a bytes object."""
+    popable_bytes = min(len(dq), n)
+    return bytes(dq.popleft() for _ in range(popable_bytes))
+
+def buffer2Ascii(intArr):
+    return bytes(intArr).decode('ascii', errors='ignore')
+
+# Get the time difference between current minus past timestamp
+def time_diff_from(pastTimeStamp):
+    return time.monotonic() - pastTimeStamp
+
 def default_dc_reset(instance):
     for f in fields(instance):
         if f.default is not MISSING:

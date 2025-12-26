@@ -46,21 +46,6 @@ logger = setup_logger("GNSSDriver")
 BUFFER_SIZE = 1024
 FIFO_QUEUE_SIZE = 512
 
-#############
-### Utils ###
-#############
-def popN(dq, n):
-    """Pop n bytes from the left of deque and return them as a bytes object."""
-    popable_bytes = min(len(dq), n)
-    return bytes(dq.popleft() for _ in range(popable_bytes))
-
-def buffer2Ascii(intArr):
-    return bytes(intArr).decode('ascii', errors='ignore')
-
-# Get the time difference between current minus past timestamp
-def time_diff_from(pastTimeStamp):
-    return time.monotonic() - pastTimeStamp
-
 #########################
 ### GNSS Driver class ###
 #########################
@@ -75,7 +60,13 @@ class GNSSDriver:
         bPendingMonRf_: bool = False
         bPendingAck_: bool = False
         bPendingPVT_: bool = False
+        bPendingStatus_: bool = False
         bPendingReset_: bool = False
+        bPendingGeofence_: bool = False
+
+        bLaunchIBIT_: bool = False
+        bLaunchGeofence_: bool = False
+        bTeardownGeofence_: bool = False
 
         def reset(self):
             default_dc_reset(self)
@@ -101,8 +92,6 @@ class GNSSDriver:
     class BIT:
         subMode_: CBITSubMode = BITSubMode.SubModeCheckCommsErrs
         startTs_: float = 0.0
-        bSentMonComms_: bool = False
-        bSentMonRf_: bool = False
         requested_mon_rf_: bool = False
         requested_comms_: bool = False
 
@@ -133,7 +122,9 @@ class GNSSDriver:
     class Operational:
         startTs_: float = 0.0
         lastPVTReqTs_: float = 0.0
+        lastGeofenceReqTs_: float = 0.0
         cbit_period_: float = CBIT_PERIOD # [sec]
+        gfence_state: GeofenceState = GeofenceState.eOFF
 
         def reset(self):
             default_dc_reset(self)
@@ -149,6 +140,49 @@ class GNSSDriver:
         success_: bool = False
         rxValgetItemsRing_: Dict[str, Any] = field(default_factory=dict)
         currentMemLayer_: CfgMemLayer = CfgMemLayer.eLayerRAM
+
+        def reset(self):
+            default_dc_reset(self)
+
+    @dataclass
+    class PVTData:
+        tstamp: float = 0
+        numSV: int = 0
+        lon: float = 0
+        lat: float = 0
+        height: float = 0
+        heightMSL: float = 0
+
+        def reset(self):
+            default_dc_reset(self)
+
+    @dataclass
+    class NavStatus:
+        tstamp: float = 0
+        iTOW: int = 0
+        gpsFix: int = 0
+        gpsFixOk: bool = 0
+        diffSoln: bool = 0
+        wknSet: bool = 0
+        towSet: bool = 0
+        diffCorr: bool = 0
+        carrSolnValid: bool = 0
+        mapMatching: int = 0
+        psmState: int = 0
+        spoofDetState: int = 0
+        carrSoln: int = 0
+        ttff: int = 0
+        msss: int = 0
+
+        def reset(self):
+            default_dc_reset(self)
+
+    @dataclass
+    class GFence:
+        iTOW: float = 0
+        status: int = 0
+        numFences: int = 0
+        combState: int = 0
 
         def reset(self):
             default_dc_reset(self)
@@ -181,28 +215,31 @@ class GNSSDriver:
         self.jamming_state = False
         self.ant_status_ = 0
         self.ant_pwr_ = 0
+        self.last_pvt = self.PVTData()
+        self.last_status = self.NavStatus()
+        self.gfence = self.GFence()
         # Analytics
         self.cksumErrors = 0
         self.wcet_ = 0.0
 
         # [CFG Handler] Used by BIT and CBIT
         self.cfgr = self.CfgCtrlData()
-        # Application-specific config only with cfg items that differ from RX defaults
-        self.ascfg_ = copy.deepcopy(APP_SPECIFIC_CFG)
-        # Default config of the Ublox receiver according to ICD
-        self.defcfg_ = copy.deepcopy(UBX_REMAINS_DEFAULT_CFG)
 
         # [BIT] mode variables
         self.bit = self.BIT()
 
         # [PBIT] mode variables
         self.pbit = self.PBIT()
+        # Application-specific config only with cfg items that differ from RX defaults
+        self.ascfg_ = copy.deepcopy(APP_SPECIFIC_CFG)
 
         # [IBIT] mode variables
         self.ibit = self.IBIT()
 
         # [CBIT] mode variables
         self.cbit = self.CBIT()
+        # Default config of the Ublox receiver according to ICD
+        self.defcfg_ = copy.deepcopy(UBX_REMAINS_DEFAULT_CFG)
 
         # [Operational] mode variables
         self.opmode = self.Operational()
@@ -243,14 +280,19 @@ class GNSSDriver:
             except Exception as e:
                 break
 
-    def Initialize(self):
+    def initialize(self):
         self.connect()
 
     def launch_ibit(self):
-        # Regardless of current state, reset all data from all states and
-        # transition immediately to IBIT
-        self.reset_all_internal_data()
-        self.driverMode_ = GnssDriverMode.IBIT
+        self.cmds.bLaunchIBIT_ = True
+
+    def activate_geofence(self):
+        self.cmds.bLaunchGeofence_ = True
+        self.cmds.bTeardownGeofence_ = False
+
+    def deactivate_geofence(self):
+        self.cmds.bLaunchGeofence_ = False
+        self.cmds.bTeardownGeofence_ = True
 
     def reset_all_internal_data(self):
         self.bit.reset()
@@ -287,8 +329,20 @@ class GNSSDriver:
     # Private member functions
     # ---------------------------------------------
     def handle_priority_cmd(self):
-        # Handle top priority commands
-        pass # TODO: add as needed
+        # Handle IBIT launch
+        if self.cmds.bLaunchIBIT_:
+            # Regardless of current state, reset all data from all states and
+            # transition immediately to IBIT
+            self.reset_all_internal_data()
+            self.driverMode_ = GnssDriverMode.IBIT
+
+        # Handle geofencing request -> reject if mode is not Operational,
+        # else leave the switch on
+        if (self.cmds.bLaunchGeofence_ or self.cmds.bTeardownGeofence_) and \
+            self.driverMode_ != GnssDriverMode.Operational:
+            logger.warning("Geofence request denied, driver not Operational yet")
+            self.cmds.bLaunchGeofence_ = False
+            self.cmds.bTeardownGeofence_ = False
 
     def handle_mode(self):
         if self.driverMode_ == GnssDriverMode.NoMode:
@@ -798,29 +852,83 @@ class GNSSDriver:
             self.opmode.startTs_ = time.monotonic()
             logger.info("Operational Mode > Launching NOW")
 
-        # Assert PVT cadence is coherent with config
-        pvt_period = get_cfg_by_name(self.ascfg_, "CFG-PM-POSUPDATEPERIOD")["actualVal"] * MS_TO_SEC
-        if time_diff_from(self.opmode.lastPVTReqTs_) > 5:
-            self.req_ubx_nav_pvt()
-            print("Pidiendo NAV PVT")
-            self.opmode.lastPVTReqTs_ = time.monotonic()
+        # Handle set up/down and status of the geofencing capability
+        # self.handle_geofencing() # FIXME
 
         self.check_transition_from_operational()
 
     def check_transition_from_operational(self):
         transition = False
 
-        # Regularly run a CBIT to check all is OK
-        if self.opmode.cbit_period_ <= 0.0:
-            logger.warning("CBIT switching period is <=0.0, so CBIT will never be performed. Not recommended.")
-        elif time_diff_from(self.opmode.startTs_) > self.opmode.cbit_period_:
-            self.driverMode_ = GnssDriverMode.CBIT
-            transition = True
+        # Check messages are received in a timely manner
+        pvt_expire_t = self.get_pvt_period()*1.2 # with some margin
+
+        if (self.last_pvt.tstamp != 0.0) and (time_diff_from(self.last_pvt.tstamp) > pvt_expire_t):
+            logger.warning("Operational Mode > not receiving PVTs timely")
+        if (self.last_status.tstamp != 0.0) and (time_diff_from(self.last_status.tstamp) > pvt_expire_t):
+            logger.warning("Operational Mode > not receiving NAV Status timely")
+
+        # If Operational Mode runs fine, check if periodic CBIT is due
+        if not transition:
+            if self.opmode.cbit_period_ <= 0.0:
+                logger.warning("Operational Mode > CBIT switching period is <=0.0, so CBIT will never be performed. Not recommended.")
+            elif time_diff_from(self.opmode.startTs_) > self.opmode.cbit_period_:
+                self.driverMode_ = GnssDriverMode.CBIT
+                transition = True
 
         if transition:
             self.opmode.reset()
 
         return transition
+
+    def get_pvt_period(self):
+        return get_cfg_by_name(self.ascfg_, "CFG-PM-POSUPDATEPERIOD")["actualVal"]
+
+    def geofence_conditions_ok(self):
+        return True # TODO
+
+    def handle_geofencing(self):
+        # See if geofence petition can be implemented
+        if self.opmode.gfence_state == GeofenceState.eOFF:
+            if self.cmds.bTeardownGeofence_:
+                logger.info("Operational Mode > Geofence already disabled.")
+                self.cmds.bTeardownGeofence_ = False
+            elif self.cmds.bLaunchGeofence_:
+                if self.geofence_conditions_ok():
+                    logger.info("Operational Mode > Requesting Geofence...")
+                    self.opmode.gfence_state = GeofenceState.eRequesting
+                    self.cmds.bPendingGeofence_ = True
+                    self.opmode.lastGeofenceReqTs_ = time.monotonic()
+                    # self.req_cfg_geofence(self.last_pvt.lat, self.last_pvt.lon)
+                    self.req_cfg_geofence_disable()
+                else:
+                    logger.warning("Operational Mode > Geofencing does not meet conditions.")
+        elif self.opmode.gfence_state == GeofenceState.eRequesting:
+            if self.cmds.bTeardownGeofence_:
+                pass # wait until Geofence ON to teardown
+            else:
+                if self.cmds.bLaunchGeofence_:
+                    logger.info("Operational Mode > Geofence already requested, WAIT!")
+                # Wait acknowledgement of the geofence request
+                if not self.cmds.bPendingAck_: # success
+                    self.opmode.gfence_state = GeofenceState.eON
+                elif time_diff_from(self.opmode.lastGeofenceReqTs_) > 2.0:
+                    self.opmode.gfence_state = GeofenceState.eOFF
+                    logger.warning("Operational Mode > couldn't set geofence.")
+
+        elif self.opmode.gfence_state == GeofenceState.eON:
+            if self.cmds.bTeardownGeofence_:
+                self.req_cfg_geofence_disable()
+            else:
+                if self.cmds.bLaunchGeofence_:
+                    logger.info("Operational Mode > Geofence already enabled!")
+                # Proceed requesting UBX-NAV_GEOFENCE normally
+                if time_diff_from(self.opmode.lastGeofenceReqTs_) > GEOFENCE_REQ_PERIOD:
+                    self.opmode.lastGeofenceReqTs_ = time.monotonic()
+                    self.req_nav_geofence()
+                # If last received geofence message is not too old, evaluate what it says
+                # TODO
+        self.cmds.bLaunchGeofence_ = False
     ################################### [END] > OPERATIONAL member functions < [END] ###################################
 
     def read_rx_ring(self):
@@ -905,9 +1013,61 @@ class GNSSDriver:
 
     def req_ubx_nav_pvt(self):
         msg = struct.pack('>H6B', 0xB562, 0x01, 0x07, 0x00, 0x00, 0x08, 0x19)
-        print([hex(x) for x in msg])
         self.send_command(msg)
         self.cmds.bPendingPVT_ = True
+
+    def req_cfg_geofence(self, lat, lon):
+        confLvl = GEOREFERENCE_CONFIDENCE
+        lat = int(round(lat / UBX_NAV_LAT_SCALE))
+        lon = int(round(lon / UBX_NAV_LON_SCALE))
+        radius = int(round(GEOREFERENCE_RADIUS_M / GEOREFERENCE_RADIUS_SCALE))
+
+        msg = struct.pack('<BB8BIBIBIiIiII',
+                          0xB5, 0x62, 0x06, 0x8a, 0x26, 0x00, 0x00,  0x01, 0x00, 0x00,
+        #                     Header,class,   ID,     length, vers, layer,  reserved0
+                          0x20240011, 0x02, # CFG-GEOFENCE-CONFLVL
+                          0x10240020, 1, # CFG-GEOFENCE-USE_FENCE1
+                          0x40240021, lat, # CFG-GEOFENCE-FENCE1_LAT
+                          0x40240022, lon, # CFG-GEOFENCE-FENCE1_LON
+                          0x40240023, radius) # CFG-GEOFENCE-FENCE1_RAD
+
+        # msg = struct.pack('>H12Biii', 0xB562, 0x06, 0x69, 0x14, 0x00, # Header, Class, ID, Length
+        #                   0x00, # version
+        #                   0x01, # numFences
+        #                   confLvl, # confLvl
+        #                   0x00, # reserved0
+        #                   0x00, 0x00, 0x00, 0x00, # pioEnabled, pinPolarity, pin, reserved1
+        #                   lat, # lat
+        #                   lon, # lon
+        #                   radius # radius
+        #                   )
+
+        # Add CRC and send
+        crc = struct.pack('<BB', *self.computeUbxCRC(msg[2:]))
+        msg = bytearray(msg + crc)
+        self.send_command(msg)
+        self.cmds.bPendingAck_ = True
+
+    def req_cfg_geofence_disable(self):
+        # Disable all fences just in case
+        msg = struct.pack('<BB8BIBIBIBIB',
+                           0xB5, 0x62, 0x06, 0x8a, 0x18, 0x00, 0x00,  0x01, 0x00, 0x00,
+        #                      Header,class,   ID,     length, vers, layer,  reserved0
+                           0x10240020, 0, # CFG-GEOFENCE-USE_FENCE1
+                           0x10240030, 0, # CFG-GEOFENCE-USE_FENCE2
+                           0x10240040, 0, # CFG-GEOFENCE-USE_FENCE3
+                           0x10240050, 0) # CFG-GEOFENCE-USE_FENCE4
+        # b5 62 06 8a 18 00 00 01 00 00 20 00 24 10 00 30 00 24 10 00 40 00 24 10 00 50 00 24 10 00 59 65
+
+        # Add CRC and send
+        crc = struct.pack('<BB', *self.computeUbxCRC(msg[2:]))
+        msg = bytearray(msg + crc)
+        self.send_command(msg)
+        self.cmds.bPendingAck_ = True
+
+    def req_nav_geofence(self):
+        msg = struct.pack('<8B', 0xB5, 0x62, 0x01, 0x39, 0x00, 0x00, 0x3A, 0xAF)
+        self.send_command(msg)
 
     def req_clear_all(self):
         # valdel_msg = struct.pack('>H14B', 0xB562, 0x06, 0x8C, 0x08, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x0F, 0xAE, 0xD3)
@@ -1192,14 +1352,77 @@ class GNSSDriver:
 
     def parseNavClassMsg(self):
         if self.msgBuffer_[UBX_MSG_ID_POS] == UBX_NAV_PVT_ID:
+            self.cmds.bPendingPVT_ = False
             numSV = struct.unpack('<B', self.msgBuffer_[UBX_NAV_PVT_NUMSV_POS : UBX_NAV_PVT_LON_POS])[0]
-            lon = struct.unpack('<i', self.msgBuffer_[UBX_NAV_PVT_LON_POS : UBX_NAV_PVT_LAT_POS])[0] / UBX_NAV_LON_SCALE
-            lat = struct.unpack('<i', self.msgBuffer_[UBX_NAV_PVT_LAT_POS : UBX_NAV_PVT_HEIGHT_POS])[0] / UBX_NAV_LAT_SCALE
-            height = struct.unpack('<i', self.msgBuffer_[UBX_NAV_PVT_LAT_POS : UBX_NAV_PVT_HEIGHT_POS])[0] / UBX_NAV_HEIGHT_SCALE
+            lon = struct.unpack('<i', self.msgBuffer_[UBX_NAV_PVT_LON_POS : UBX_NAV_PVT_LAT_POS])[0] * UBX_NAV_LON_SCALE
+            lat = struct.unpack('<i', self.msgBuffer_[UBX_NAV_PVT_LAT_POS : UBX_NAV_PVT_HEIGHT_POS])[0] * UBX_NAV_LAT_SCALE
+            height = struct.unpack('<i', self.msgBuffer_[UBX_NAV_PVT_HEIGHT_POS : UBX_NAV_PVT_HMSL_POS])[0] * UBX_NAV_HEIGHT_SCALE
+            heightMSL = struct.unpack('<i', self.msgBuffer_[UBX_NAV_PVT_HMSL_POS : UBX_NAV_PVT_HACC_POS])[0] * UBX_NAV_HEIGHT_SCALE
 
-            # print(f"\r{numSV=}, {lon=:.4f}, {lat=:.4f}, {height=:.2f}", end="", flush=True)
-            self.lastPVTTstamp_ = time.monotonic()
-            logger.debug(f"{numSV=} {lon=} {lat=} {height=} | Last update: {self.lastPVTTstamp_}")
+            # Fill last PVT data struct with PVT that just arrived
+            self.last_pvt = self.PVTData(
+                tstamp=time.monotonic(),
+                numSV=numSV,
+                lon=lon,
+                lat=lat,
+                height=height,
+                heightMSL=heightMSL,
+            )
+            logger.debug(f"{numSV=} {lon=} {lat=} {heightMSL=} | Last update: {self.last_pvt.tstamp}")
+
+        elif self.msgBuffer_[UBX_MSG_ID_POS] == UBX_NAV_STATUS_ID:
+            self.cmds.bPendingStatus_ = False
+            iTOW = struct.unpack('<I', self.msgBuffer_[UBX_NAV_STATUS_ITOW_POS : UBX_NAV_STATUS_GPSFIX_POS])[0]
+            gpsFix = struct.unpack('<B', self.msgBuffer_[UBX_NAV_STATUS_GPSFIX_POS : UBX_NAV_STATUS_FLAGS_POS])[0]
+            flags = struct.unpack('<B', self.msgBuffer_[UBX_NAV_STATUS_FLAGS_POS : UBX_NAV_STATUS_FIXSTAT_POS])[0]
+            gpsFixOk = bool(flags & (1 << 0))
+            diffSoln = bool(flags & (1 << 1))
+            wknSet = bool(flags & (1 << 2))
+            towSet = bool(flags & (1 << 3))
+
+            fixStat = struct.unpack('<B', self.msgBuffer_[UBX_NAV_STATUS_FIXSTAT_POS : UBX_NAV_STATUS_FLAGS2_POS])[0]
+            diffCorr = bool(flags & (1 << 0))
+            carrSolnValid = bool(flags & (1 << 1))
+            mapMatching = (fixStat >> 6) & 0b11
+            flags2 = struct.unpack('<B', self.msgBuffer_[UBX_NAV_STATUS_FLAGS2_POS : UBX_NAV_STATUS_TTFF_POS])[0]
+            psmState = flags2 & 0b11
+            spoofDetState = (flags2 >> 3) & 0b11
+            carrSoln = (flags2 >> 6) & 0b11
+            ttff = struct.unpack('<I', self.msgBuffer_[UBX_NAV_STATUS_TTFF_POS : UBX_NAV_STATUS_MSSS_POS])[0]
+            msss = struct.unpack('<I', self.msgBuffer_[UBX_NAV_STATUS_MSSS_POS : UBX_NAV_STATUS_MSSS_POS+4])[0]
+
+            # Fill last status data struct with the status info that just arrived
+            self.last_status = self.NavStatus(
+                tstamp=time.monotonic(),
+                iTOW=iTOW,
+                gpsFix=gpsFix,
+                gpsFixOk=gpsFixOk,
+                diffSoln=diffSoln,
+                wknSet=wknSet,
+                towSet=towSet,
+                diffCorr=diffCorr,
+                carrSolnValid=carrSolnValid,
+                mapMatching=mapMatching,
+                psmState=psmState,
+                spoofDetState=spoofDetState,
+                carrSoln=carrSoln,
+                ttff=ttff,
+                msss=msss
+            )
+            logger.debug(self.last_status)
+
+        elif self.msgBuffer_[UBX_MSG_ID_POS] == UBX_NAV_GEOFENCE_ID:
+            iTOW = struct.unpack('<I', self.msgBuffer_[UBX_NAV_GEOFENCE_ITOW_POS : UBX_NAV_GEOFENCE_STATUS_POS])[0]
+            status = struct.unpack('<B', self.msgBuffer_[UBX_NAV_GEOFENCE_STATUS_POS : UBX_NAV_GEOFENCE_NUMFENCES_POS])[0]
+            numFences = struct.unpack('<B', self.msgBuffer_[UBX_NAV_GEOFENCE_NUMFENCES_POS : UBX_NAV_GEOFENCE_COMBSTATE_POS])[0]
+            combState = struct.unpack('<B', self.msgBuffer_[UBX_NAV_GEOFENCE_COMBSTATE_POS : UBX_NAV_GEOFENCE_COMBSTATE_POS+1])[0]
+            self.gfence = self.GFence(
+                iTOW=iTOW,
+                status=status,
+                numFences=numFences,
+                combState=combState
+            )
+            logger.debug(f"{status=}, {numFences=}, {combState=}")
         else:
             logger.debug(f"Unknown NAV class message with ID {self.msgBuffer_[UBX_MSG_ID_POS]}")
 
@@ -1293,15 +1516,19 @@ class GNSSDriver:
 ############
 def input_listener(driver):
     while driver.is_connected():
-        cmd = input("").strip()
-        if cmd == "ibit" or cmd == "IBIT":
+        cmd = input("").strip().lower()
+        if cmd == "ibit":
             driver.launch_ibit()
+        elif cmd == "gfon" or cmd == "geofence_activate":
+            driver.activate_geofence()
+        elif cmd == "gfoff" or cmd == "geofence_deactivate":
+            driver.deactivate_geofence()
 
 if __name__ == "__main__":
-    driver = GNSSDriver(port='COM4', baudrate=38400)
+    driver = GNSSDriver(port='COM5', baudrate=38400)
 
     # Init
-    driver.Initialize()
+    driver.initialize()
 
     threading.Thread(target=input_listener, args=(driver,), daemon=True).start()
 
