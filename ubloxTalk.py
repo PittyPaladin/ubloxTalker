@@ -188,6 +188,7 @@ class GNSSDriver:
             default_dc_reset(self)
 
     def __init__(self, port='COM3', baudrate=9600, timeout=1):
+        # USB Connection
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
@@ -196,10 +197,8 @@ class GNSSDriver:
         self.lock = threading.Lock()
         self.read_thread = None
 
-        # Driver's Finite State Machine (FSM) mode
-        self.driverMode_ = GnssDriverMode.NoMode
-
-        self.rxRing_ = deque(maxlen=BUFFER_SIZE)  # Circular buffer for RX
+        # Circular buffer for RX
+        self.rxRing_ = deque(maxlen=BUFFER_SIZE)
         self.ringBytesToRead_ = 1
         self.msgBuffer_ = bytearray(BUFFER_SIZE)
         self.msgIdx_ = 0 # working index of the msg buffer
@@ -221,6 +220,9 @@ class GNSSDriver:
         # Analytics
         self.cksumErrors = 0
         self.wcet_ = 0.0
+
+        # Driver's Finite State Machine (FSM) mode
+        self.driverMode_ = GnssDriverMode.NoMode
 
         # [CFG Handler] Used by BIT and CBIT
         self.cfgr = self.CfgCtrlData()
@@ -279,9 +281,6 @@ class GNSSDriver:
                         self.rxRing_.extend( list(self.ser.readline()) )
             except Exception as e:
                 break
-
-    def initialize(self):
-        self.connect()
 
     def launch_ibit(self):
         self.cmds.bLaunchIBIT_ = True
@@ -935,9 +934,11 @@ class GNSSDriver:
         with self.lock:
             # Read until emptying the ring
             ringLen = len(self.rxRing_)
-            for _ in range(ringLen):
+            while True:
                 # Read a certain number of bytes from the RX ring into a <class 'bytes'>
                 msg = popN(self.rxRing_, self.ringBytesToRead_)
+                if len(msg) == 0:
+                    break
                 bytesRead = len(msg)
                 # Update bytes to read subtracting the ones read just now
                 self.ringBytesToRead_ -= bytesRead
@@ -1528,7 +1529,7 @@ if __name__ == "__main__":
     driver = GNSSDriver(port='COM5', baudrate=38400)
 
     # Init
-    driver.initialize()
+    driver.connect()
 
     threading.Thread(target=input_listener, args=(driver,), daemon=True).start()
 
