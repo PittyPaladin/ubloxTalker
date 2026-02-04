@@ -933,7 +933,6 @@ class GNSSDriver:
     def read_rx_ring(self):
         with self.lock:
             # Read until emptying the ring
-            ringLen = len(self.rxRing_)
             while True:
                 # Read a certain number of bytes from the RX ring into a <class 'bytes'>
                 msg = popN(self.rxRing_, self.ringBytesToRead_)
